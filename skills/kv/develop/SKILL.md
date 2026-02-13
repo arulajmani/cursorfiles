@@ -182,6 +182,83 @@ source changes that triggered the regeneration.
   }
   ```
 
+## String Formatting and Redaction
+
+When adding a `String()` method to a struct, always implement
+`redact.SafeFormatter` first and then build `String()` on top of it. This
+ensures log output is redaction-safe by default.
+
+**Before implementing**, ask the user whether all fields in the struct are
+considered safe (i.e. never contain PII or customer data). Numeric IDs, counts,
+timestamps, and internal enums are typically safe. Strings derived from user
+input, SQL statements, or key contents are typically unsafe. The answer
+determines whether the `SafeFormat` implementation can use `w.Printf()` for
+everything or needs to treat some fields as unsafe.
+
+**Pattern:**
+
+```go
+import "github.com/cockroachdb/redact"
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (s *MyStruct) SafeFormat(w redact.SafePrinter, _ rune) {
+    w.Printf("field1=%d, field2=%d", s.Field1, s.Field2)
+}
+
+// String implements the fmt.Stringer interface.
+func (s *MyStruct) String() string {
+    return redact.StringWithoutMarkers(s)
+}
+```
+
+**Testing:** Add an `echotest` that pins the formatted output and verifies
+that nothing is lost in redaction. Two additional requirements:
+
+1. **Use `zerofields.NoZeroField`** to validate that the test input has every
+   field set to a non-zero value. This way, if someone adds a new field to the
+   struct, the test fails until the new field is accounted for in both the test
+   data and the `SafeFormat` implementation.
+2. **Use `t.Name()`** as the testdata file/directory name — never hardcode a
+   filename string.
+
+Single-case example:
+
+```go
+func TestMyStructSafeFormat(t *testing.T) {
+    defer leaktest.AfterTest(t)()
+
+    s := MyStruct{Field1: 42, Field2: 7}
+    require.NoError(t, zerofields.NoZeroField(s),
+        "update test and SafeFormat for the new field")
+    redacted := string(redact.Sprint(s))
+    unredacted := s.String()
+    require.Equal(t, unredacted, redacted,
+        "redacted and unredacted output should be identical (all fields are safe)")
+    echotest.Require(t, redacted,
+        datapathutils.TestDataPath(t, t.Name()))
+}
+```
+
+For table-driven tests with multiple cases, use `t.Name()` inside each subtest
+so each case gets its own testdata file under a directory named after the parent
+test:
+
+```go
+for _, tc := range testCases {
+    t.Run(tc.name, func(t *testing.T) {
+        require.NoError(t, zerofields.NoZeroField(tc.input), ...)
+        redacted := string(redact.Sprint(tc.input))
+        echotest.Require(t, redacted,
+            datapathutils.TestDataPath(t, t.Name()))
+    })
+}
+```
+
+If the struct contains fields that are *not* safe (e.g. user-supplied strings),
+use `w.SafeString()` / `w.Printf()` for the safe parts and `w.Print()` for the
+unsafe parts. In that case the redacted and unredacted output will differ, so
+test them separately.
+
 ## GitHub Integration
 
 Use `gh` to interact with GitHub. In particular, when looking at PRs and issues,
